@@ -16,7 +16,7 @@ const int ENC_R_A = 3;
 const int ENC_R_B = 5;
 */
 
-const int MOTOR_PWM = 180;
+const int MOTOR_PWM = 220;
 
 void setup() {
     pinMode(IN1_L, OUTPUT);
