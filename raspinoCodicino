@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+"""
+Raspberry Pi 5 - Sistema di visione per rilevamento bersagli
+Utilizza Picamera2 e OpenCV per identificare cerchi concentrici colorati
+"""
+
+import cv2                                  
+import numpy as np
+from picamera2 import Picamera2
+import serial
+import serial.tools.list_ports
+import time
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
+import os
+
+
+class TargetDetector:
+    """Rilevatore di bersagli circolari con anelli colorati"""
+    
+    def __init__(self, serial_port=None, baud_rate=115200):
+        """Inizializza camera e connessione seriale"""
+
+       # Mappa colori → punteggio
+        self.COLOR_VALUES = {
+            "black": -2,
+            "red":   -1,
+            "yellow": 0,
+            "green":  1,
+            "blue":   2,
+        }
+
+        # Prepara i riferimenti HSV
+        self.REF_HSV = self._prepara_riferimenti_hsv()
+
+        # Inizializza Picamera2
+        self.camera = Picamera2()
+        config = self.camera.create_still_configuration(
+            main={"size": (1280, 720)},
+            #main={"size": (1920, 1080)},
+            buffer_count=2,
+            controls={"AfMode": 2}  # <--- autofocus continuo
+        )
+        self.camera.configure(config)
+        self.camera.start()
+        time.sleep(2)  # Attesa stabilizzazione camera
+        
+        # Parametri connessione seriale
+        self.serial_port = serial_port  # None = ricerca automatica
+        self.baud_rate = baud_rate
+        self.serial = None
+        self.connect_to_arduino()
+        
+        self.target_diameter_cm = 5.0
+        self.ring_width_cm = 0.5
+        self.num_rings = 5
+   
+    
+    def _prepara_riferimenti_hsv(self):
+        """
+        Crea i colori di riferimento (nero, rosso, giallo, verde, blu)
+        in HSV, partendo da BGR ideali.
+        """
+        ref_bgr = {
+            "black":  (0,   0,   0),
+            "red":    (0,   0, 255),
+            "yellow": (0, 255, 255),
+            "green":  (0, 255,   0),
+            "blue":   (255, 0,   0),
+        }
+        ref_hsv = {}
+        for name, bgr in ref_bgr.items():
+            sample = np.uint8([[bgr]])          # immagine 1x1
+            hsv = cv2.cvtColor(sample, cv2.COLOR_BGR2HSV)[0, 0]
+            ref_hsv[name] = hsv.astype(np.float32)
+        return ref_hsv
+    
+    def classifica_colore(self, bgr_color):
+        """
+        Dato un colore medio in BGR, lo converte in HSV e
+        lo assegna al colore più vicino tra:
+        black, red, yellow, green, blue
+        usando distanza euclidea nello spazio HSV.
+        """
+        sample = np.uint8([[bgr_color]])
+        hsv = cv2.cvtColor(sample, cv2.COLOR_BGR2HSV)[0, 0].astype(np.float32)
+
+        best_name = None
+        best_dist = float("inf")
+        for name, ref in self.REF_HSV.items():
+            # piccola correzione per l'angolo H del rosso (0/180) se serve
+            diff = hsv - ref
+            # per il canale H gestiamo il wrap (0-180)
+            diff[0] = min(abs(diff[0]), 180 - abs(diff[0]))
+            dist = np.linalg.norm(diff)
+            if dist < best_dist:
+                best_dist = dist
+                best_name = name
+
+        return best_name
+    
+    
+    def trova_cerchio_esterno(self, frame):
+        #color range HSV,  high,low
+        COLOR_RANGES = {
+        "red1":  ([0, 120, 70],   [10, 255, 255]),
+        "red2":  ([170, 120, 70], [180, 255, 255]),
+        "yellow":([20, 100, 100],  [35, 255, 255]),
+        "green": ([40, 70, 70],  [85, 255, 255]),
+        "blue":  ([90, 80, 70],  [130, 255, 255]),
+        "black": ([0, 0, 0],     [180, 255, 50])
+        }
+        
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        mask = None
+        
+        # Maschera combinata
+        mask = None
+        for low, high in COLOR_RANGES.values():
+            low = np.array(low)
+            high = np.array(high)
+            m = cv2.inRange(hsv, low, high)
+            mask = m if mask is None else (mask | m)
+        
+        # Pulizia
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        
+        # CAMBIAMENTO CHIAVE: usa RETR_TREE per trovare tutti i contorni
+        cnts, hierarchy = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+        if not cnts:
+            return None
+        
+        # Trova i cerchi concentrici (quelli senza parent nella gerarchia)
+        # hierarchy[0][i] = [next, previous, first_child, parent]
+        circles = []
+        for i, cnt in enumerate(cnts):
+            area = cv2.contourArea(cnt)
+            if area < 100:  # Filtra contorni troppo piccoli
+                continue
+            
+            (x, y), r = cv2.minEnclosingCircle(cnt)
+            
+            # Verifica che sia approssimativamente circolare
+            perimeter = cv2.arcLength(cnt, True)
+            circularity = 4 * np.pi * area / (perimeter * perimeter) if perimeter > 0 else 0
+            
+            if circularity > 0.7:  # È abbastanza circolare
+                circles.append(((int(x), int(y), int(r)), area))
+        
+        if not circles:
+            return None
+        
+        # Ordina per raggio (il più grande è il cerchio esterno)
+        circles.sort(key=lambda c: c[0][2], reverse=True)
+
+        # Estrai i valori espliciti
+        x, y, r = circles[0][0]
+        
+        return x, y, r  # Restituisce (x, y, r) del cerchio più grande
+
+    
+    def find_arduino_port(self):
+        """Cerca automaticamente la porta Arduino (ttyACM0 o ttyACM1)"""
+        # Lista delle porte possibili in ordine di priorità
+        possible_ports = ['/dev/ttyACM0', '/dev/ttyACM1']
+        
+        # Cerca usando pyserial
+        available_ports = [port.device for port in serial.tools.list_ports.comports()]
+        
+        print("🔍 Ricerca porta Arduino...")
+        print(f"   Porte disponibili: {available_ports if available_ports else 'Nessuna'}")
+        
+        # Cerca nelle porte possibili
+        for port in possible_ports:
+            if port in available_ports:
+                print(f"   ✓ Trovata: {port}")
+                return port
+        
+        # Se non trovata, prova comunque le porte standard
+        for port in possible_ports:
+            try:
+                test_serial = serial.Serial(port, self.baud_rate, timeout=0.5)
+                test_serial.close()
+                print(f"   ✓ Connessione test OK: {port}")
+                return port
+            except:
+                continue
+        
+        print("   ✗ Nessuna porta Arduino trovata")
+        return None
+    
+    def connect_to_arduino(self):
+        """Connette ad Arduino con retry e ricerca automatica porta"""
+        max_retries = 5
+        retry_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                # Chiudi connessione precedente se esistente
+                if self.serial and self.serial.is_open:
+                    self.serial.close()
+                    time.sleep(0.5)
+                
+                # Trova la porta (ricerca automatica se non specificata)
+                if self.serial_port is None:
+                    port = self.find_arduino_port()
+                    if port is None:
+                        raise Exception("Porta Arduino non trovata")
+                else:
+                    port = self.serial_port
+                
+                # Tenta connessione
+                self.serial = serial.Serial(port, self.baud_rate, timeout=1)
+                self.serial_port = port  # Memorizza la porta usata
+                time.sleep(2)  # Attesa stabilizzazione Arduino
+                
+                print(f"✓ Connesso ad Arduino su {port}")
+                return True
+                
+            except Exception as e:
+                print(f"✗ Tentativo {attempt + 1}/{max_retries} fallito: {e}")
+                # Resetta la porta per forzare ricerca al prossimo tentativo
+                if attempt < max_retries - 1:
+                    self.serial_port = None
+                    print(f"  Riprovo tra {retry_delay} secondi...")
+                    time.sleep(retry_delay)
+        
+        print("✗ ERRORE: Impossibile connettersi ad Arduino")
+        self.serial = None
+        return False
+    
+    def check_serial_connection(self):
+        """Verifica se la connessione seriale è attiva"""
+        if not self.serial or not self.serial.is_open:
+            print("⚠ Connessione seriale persa, tentativo di riconnessione...")
+            # Resetta la porta per forzare ricerca automatica
+            self.serial_port = None
+            return self.connect_to_arduino()
+        return True
+    
+        
+    def send_to_arduino(self, value: int):
+        """Invia il valore ad Arduino via seriale con gestione errori"""
+        if not self.check_serial_connection():
+            print("✗ Impossibile inviare dati: connessione non disponibile")
+            return False
+        
+        try:
+            message = f"{value}\n"
+            self.serial.write(message.encode())
+            self.serial.flush()  # Assicura invio immediato
+            print(f"✓ Inviato ad Arduino: {value}")
+            return True
+        except serial.SerialException as e:
+            print(f"✗ Errore seriale durante invio: {e}")
+            self.serial = None  # Forza riconnessione
+            return False
+        except Exception as e:
+            print(f"✗ Errore generico durante invio: {e}")
+            return False
+    
+    def process_frame(self, mostra_debug: bool):
+        """Processa un frame dalla camera"""
+        frame = self.camera.capture_array()  #RGB
+        
+        # Converti da RGB a BGR per OpenCV
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        
+        h, w = frame_bgr.shape[:2]
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+
+        # Trova il cerchio esterno e raggio
+        result = self.trova_cerchio_esterno(frame_bgr)
+        print(f"coordinate centro {result}" )
+        # Se non trova il cerchio, ritorna None
+        if result is None:
+            print("⚠ Nessun cerchio rilevato nel frame")
+            return None, None, None
+        
+        cx, cy, r_outer = result
+        print(f"Centro cerchio {cx, cy}, raggio esterno {r_outer}:")
+
+        # Se vogliamo vedere il centro/cerchio (debug)
+        if mostra_debug:
+            dbg = frame_bgr.copy()
+            cv2.circle(dbg, (cx, cy), r_outer, (0, 255, 0), 2)
+            cv2.circle(dbg, (cx, cy), 2, (0, 0, 25), 3)
+            cv2.imshow("Debug cerchio esterno", dbg)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+        
+        colors = []
+        values = []
+
+        # Dividiamo il raggio in 5 anelli uguali (misure sono in pixel)
+        step = r_outer / self.num_rings
+        print(f"step anelli: {step}")
+        for i in range(self.num_rings):
+            inner_r = int(i * step)
+            outer_r = int((i + 1) * step) - 1
+            print(f"Anello {i+1}: raggio interno {inner_r}, raggio esterno {outer_r}")
+
+            # maschera dell'anello
+            mask_outer = np.zeros((h, w), dtype=np.uint8)
+            mask_inner = np.zeros((h, w), dtype=np.uint8)
+
+            cv2.circle(mask_outer, (cx, cy), outer_r, 255, thickness=-1)
+            cv2.circle(mask_inner, (cx, cy), inner_r, 255, thickness=-1)
+
+            ring_mask = cv2.subtract(mask_outer, mask_inner)
+
+            # media del colore BGR dentro l'anello
+            mean_b, mean_g, mean_r, _ = cv2.mean(frame_bgr, mask=ring_mask)
+            mean_color = (mean_b, mean_g, mean_r)
+
+            color_name = self.classifica_colore(mean_color)
+            value = self.COLOR_VALUES[color_name]
+
+            colors.append(color_name)
+            values.append(value)
+
+        total = sum(values)
+        # Stampa risultati in stile “regole”
+        #print("Risultati analisi immagine:", path_img)
+        print("Anelli dal centro verso l’esterno:")
+        for i, (c, v) in enumerate(zip(colors, values), start=1):
+            print(f"  Anello {i}: {c}  → valore {v}")
+
+        print(f"\nSomma totale: {total}")
+
+        # Interpretazione secondo regole RoboCup
+        if total == 0:
+            print("→ Bersaglio valido: Sum = 0 (solo identificazione, LED e stop 5s).")
+        elif total == 1:
+            print("→ Bersaglio valido: Sum = 1 (identificazione + 1 kit di soccorso).")
+        elif total == 2:
+            print("→ Bersaglio valido: Sum = 2 (identificazione + 2 kit di soccorso).")
+        else:
+            print("→ Bersaglio FALSO: Sum < 0 oppure > 2 (misidentificazione → -5 punti).")
+
+        
+
+        #if mostra_debug:
+        # --- SALVATAGGIO SU FILE per Debug ---
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        save_dir = "captured_frames"
+        os.makedirs(save_dir, exist_ok=True)
+
+        # Salva immagine annotata
+        annotated_path = os.path.join(save_dir, f"frame_{timestamp}_annotated.jpg")
+        #cv2.imwrite(annotated_path, frame_bgr)
+        cv2.imwrite(annotated_path, dbg)
+
+        # Salva immagine originale (opzionale)
+        original_path = os.path.join(save_dir, f"frame_{timestamp}_raw.jpg")
+        cv2.imwrite(original_path, frame)
+            
+        return colors, values, total
+        #return frame_bgr, best_target_sum
+    
+    def wait_for_arduino_request(self):
+        """Attende richiesta da Arduino per analisi con gestione riconnessione"""
+        if not self.check_serial_connection():
+            return False
+        
+        try:
+            if self.serial.in_waiting > 0:
+                message = self.serial.readline().decode().strip()
+                if message == "ANALYZE":
+                    return True
+        except serial.SerialException as e:
+            print(f"✗ Errore seriale durante ricezione: {e}")
+            self.serial = None  # Forza riconnessione
+            return False
+        except UnicodeDecodeError as e:
+            print(f"⚠ Errore decodifica messaggio: {e}")
+            return False
+        except Exception as e:
+            print(f"✗ Errore generico durante ricezione: {e}")
+            self.serial = None  # Forza riconnessione
+            return False
+        
+        return False
+    
+    def run(self):
+        """Loop principale con gestione riconnessione"""
+        print("=" * 60)
+        print("Sistema di visione attivo")
+        print("In attesa di richieste da Arduino...")
+        print("Premi Ctrl+C per terminare")
+        print("=" * 60)
+        
+        consecutive_errors = 0
+        max_consecutive_errors = 5
+        
+        try:
+            while True:
+                # Verifica connessione
+                if not self.check_serial_connection():
+                    consecutive_errors += 1
+                    if consecutive_errors >= max_consecutive_errors:
+                        print(f"✗ Troppi errori consecutivi ({consecutive_errors}). Uscita.")
+                        break
+                    print(f"⚠ Errore {consecutive_errors}/{max_consecutive_errors}. Riprovo...")
+                    time.sleep(2)
+                    continue
+                
+                # Reset contatore errori se connessione OK
+                consecutive_errors = 0
+                
+                # Attende richiesta da Arduino
+                if self.wait_for_arduino_request():
+                    print("\n" + "=" * 60)
+                    print("📸 Richiesta analisi ricevuta da Arduino")
+                    print("=" * 60)
+                    
+                    # Cattura e analizza frame
+                    colors, values, target_sum = self.process_frame(True)
+                    
+                    # Invia risultato ad Arduino
+                    if target_sum is not None:
+                        if self.send_to_arduino(target_sum):
+                            print(f"✓ Analisi completata: Score = {target_sum}")
+                        else:
+                            print("✗ Invio fallito, Arduino potrebbe non aver ricevuto")
+                    else:
+                        # Nessun bersaglio trovato
+                        print("⚠ Nessun bersaglio rilevato nell'immagine")
+                        self.send_to_arduino(-999)
+                    
+                    print("=" * 60 + "\n")
+                
+                time.sleep(0.1)
+                
+        except KeyboardInterrupt:
+            print("\n\n🛑 Interruzione da tastiera")
+        except Exception as e:
+            print(f"\n✗ Errore critico: {e}")
+        finally:
+            self.cleanup()
+    
+    def cleanup(self):
+        """Chiude le risorse"""
+        print("\n🔧 Chiusura risorse...")
+        
+        try:
+            self.camera.stop()
+            print("✓ Camera fermata")
+        except Exception as e:
+            print(f"⚠ Errore chiusura camera: {e}")
+        
+        try:
+            if self.serial and self.serial.is_open:
+                self.serial.close()
+                print("✓ Connessione seriale chiusa")
+        except Exception as e:
+            print(f"⚠ Errore chiusura seriale: {e}")
+        
+        print("✓ Tutte le risorse rilasciate")
+        print("👋 Arrivederci!")
+
+if __name__ == "__main__":
+    # Avvia con ricerca automatica della porta (None = auto-detect)
+    detector = TargetDetector(serial_port=None, baud_rate=115200)
+    detector.run()
