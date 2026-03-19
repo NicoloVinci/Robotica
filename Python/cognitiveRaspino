@@ -1,0 +1,252 @@
+import cv2
+import numpy as np
+import sys
+
+# Mappa colori → punteggio
+COLOR_VALUES = {
+    "black": -2,
+    "red":   -1,
+    "yellow": 0,
+    "green":  1,
+    "blue":   2,
+}
+
+def prepara_riferimenti_hsv():
+    """
+    Crea i colori di riferimento (nero, rosso, giallo, verde, blu)
+    in HSV, partendo da BGR ideali.
+    """
+    ref_bgr = {
+        "black":  (0,   0,   0),
+        "red":    (0,   0, 255),
+        "yellow": (0, 255, 255),
+        "green":  (0, 255,   0),
+        "blue":   (255, 0,   0),
+    }
+
+    ref_hsv = {}
+    for name, bgr in ref_bgr.items():
+        sample = np.uint8([[bgr]])          # immagine 1x1
+        hsv = cv2.cvtColor(sample, cv2.COLOR_BGR2HSV)[0, 0]
+        ref_hsv[name] = hsv.astype(np.float32)
+    return ref_hsv
+
+REF_HSV = prepara_riferimenti_hsv()
+
+
+def classifica_colore(bgr_color):
+    """
+    Dato un colore medio in BGR, lo converte in HSV e
+    lo assegna al colore più vicino tra:
+    black, red, yellow, green, blue
+    usando distanza euclidea nello spazio HSV.
+    """
+    sample = np.uint8([[bgr_color]])
+    hsv = cv2.cvtColor(sample, cv2.COLOR_BGR2HSV)[0, 0].astype(np.float32)
+
+    best_name = None
+    best_dist = float("inf")
+    for name, ref in REF_HSV.items():
+        # piccola correzione per l'angolo H del rosso (0/180) se serve
+        diff = hsv - ref
+        # per il canale H gestiamo il wrap (0-180)
+        diff[0] = min(abs(diff[0]), 180 - abs(diff[0]))
+        dist = np.linalg.norm(diff)
+        if dist < best_dist:
+            best_dist = dist
+            best_name = name
+
+    return best_name
+
+'''
+def trova_cerchio_esterno(gray):
+    """
+    Usa HoughCircles per trovare il cerchio più grande (quello esterno).
+    funziona bene con immagini png ovvero sfondo trasparente
+    Ritorna (cx, cy, r) interi.
+    """
+    # blur per migliorare la rilevazione
+    blur = cv2.medianBlur(gray, 5)
+
+    # parametri Hough da poter aggiustare se necessario
+    circles = cv2.HoughCircles(
+        blur,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=50,
+        param1=100,
+        param2=30,
+        minRadius=0,
+        maxRadius=0
+    )
+
+    if circles is None:
+        raise RuntimeError("Impossibile rilevare i cerchi (HoughCircles non ha trovato nulla).")
+
+    circles = np.uint16(np.around(circles[0, :]))
+    # scegliamo il cerchio con raggio massimo
+    outer = max(circles, key=lambda c: c[2])
+    cx, cy, r = int(outer[0]), int(outer[1]), int(outer[2])
+    return cx, cy, r
+'''
+def trova_cerchio_esterno(frame):
+ 
+    
+    COLOR_RANGES = {
+        "red1":  ([0, 80, 50],   [10, 255, 255]),
+        "red2":  ([170, 80, 50], [180, 255, 255]),
+        "yellow":([20, 80, 50],  [35, 255, 255]),
+        "green": ([40, 60, 40],  [85, 255, 255]),
+        "blue":  ([100, 100, 100],  [130, 255, 255]),
+        "black": ([0, 0, 0],     [180, 255, 60])
+    }
+    
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    
+    # Maschera combinata
+    mask = None
+    for low, high in COLOR_RANGES.values():
+        low = np.array(low)
+        high = np.array(high)
+        m = cv2.inRange(hsv, low, high)
+        mask = m if mask is None else (mask | m)
+    
+    # Pulizia
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    
+    # CAMBIAMENTO CHIAVE: usa RETR_TREE per trovare tutti i contorni
+    cnts, hierarchy = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not cnts:
+        return None
+    
+    # Trova i cerchi concentrici (quelli senza parent nella gerarchia)
+    # hierarchy[0][i] = [next, previous, first_child, parent]
+    circles = []
+    for i, cnt in enumerate(cnts):
+        area = cv2.contourArea(cnt)
+        if area < 100:  # Filtra contorni troppo piccoli
+            continue
+        
+        (x, y), r = cv2.minEnclosingCircle(cnt)
+        
+        # Verifica che sia approssimativamente circolare
+        perimeter = cv2.arcLength(cnt, True)
+        circularity = 4 * np.pi * area / (perimeter * perimeter) if perimeter > 0 else 0
+        
+        if circularity > 0.7:  # È abbastanza circolare
+            circles.append(((int(x), int(y), int(r)), area))
+    
+    if not circles:
+        return None
+    
+    # Ordina per raggio (il più grande è il cerchio esterno)
+    circles.sort(key=lambda c: c[0][2], reverse=True)
+
+    # Estrai i valori espliciti
+    x, y, r = circles[0][0]
+    
+    return x, y, r  # Restituisce (x, y, r) del cerchio più grande
+
+def calcola_punteggio_immagine(path_img, mostra_debug:bool):
+    """
+    Carica l'immagine, rileva i 5 anelli concentrici, classifica il colore di ciascuno,
+    calcola i punti totali e stampa il risultato.
+
+    Ritorna: (lista_colori, lista_valori, somma)
+    """
+    img = cv2.imread(path_img)
+    if img is None:
+        raise FileNotFoundError(f"Impossibile aprire l'immagine: {path_img}")
+
+    h, w = img.shape[:2]
+    print( img.shape )
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Trova il cerchio esterno
+    #cx, cy, r_outer = trova_cerchio_esterno(gray)
+    result = trova_cerchio_esterno(img)
+    #centro del cerchio esterno e raggio
+    if result is None:
+        print("Errore: Nessun cerchio trovato nell'immagine")
+        if mostra_debug:
+            cv2.imshow("Immagine originale", img)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+        return None  # oppure return 0, 0, 0 o quello che preferisci
+    
+    cx, cy, r_outer = result
+    print(f"Centro: ({cx}, {cy}), Raggio: {r_outer}")
+    #print(f"Centro cerchio {cx, cy}, raggio esterno {r_outer}:")
+
+    # Se vogliamo vedere il centro/cerchio (debug)
+    if mostra_debug:
+        dbg = img.copy()
+        cv2.circle(dbg, (cx, cy), r_outer, (0, 255, 0), 2)
+        cv2.circle(dbg, (cx, cy), 2, (0, 0, 25), 3)
+        cv2.imshow("Debug cerchio esterno", dbg)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+    colors = []
+    values = []
+
+    # Dividiamo il raggio in 5 anelli uguali (misure sono in pixel)
+    step = r_outer / 5.0
+    print(f"step anelli: {step}")
+    for i in range(5):
+        inner_r = int(i * step)
+        outer_r = int((i + 1) * step) - 1
+        print(f"Anello {i+1}: raggio interno {inner_r}, raggio esterno {outer_r}")
+
+        # maschera dell'anello
+        mask_outer = np.zeros((h, w), dtype=np.uint8)
+        mask_inner = np.zeros((h, w), dtype=np.uint8)
+
+        cv2.circle(mask_outer, (cx, cy), outer_r, 255, thickness=-1)
+        cv2.circle(mask_inner, (cx, cy), inner_r, 255, thickness=-1)
+
+        ring_mask = cv2.subtract(mask_outer, mask_inner)
+
+        # media del colore BGR dentro l'anello
+        mean_b, mean_g, mean_r, _ = cv2.mean(img, mask=ring_mask)
+        mean_color = (mean_b, mean_g, mean_r)
+
+        color_name = classifica_colore(mean_color)
+        value = COLOR_VALUES[color_name]
+
+        colors.append(color_name)
+        values.append(value)
+
+    total = sum(values)
+
+    # Stampa risultati in stile “regole”
+    print("Risultati analisi immagine:", path_img)
+    print("Anelli dal centro verso l’esterno:")
+    for i, (c, v) in enumerate(zip(colors, values), start=1):
+        print(f"  Anello {i}: {c}  → valore {v}")
+
+    print(f"\nSomma totale: {total}")
+
+    # Interpretazione secondo regole RoboCup
+    if total == 0:
+        print("→ Bersaglio valido: Sum = 0 (solo identificazione, LED e stop 5s).")
+    elif total == 1:
+        print("→ Bersaglio valido: Sum = 1 (identificazione + 1 kit di soccorso).")
+    elif total == 2:
+        print("→ Bersaglio valido: Sum = 2 (identificazione + 2 kit di soccorso).")
+    else:
+        print("→ Bersaglio FALSO: Sum < 0 oppure > 2 (misidentificazione → -5 punti).")
+
+    return colors, values, total
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Uso: python cognitive_target_score.py immagine.png")
+        sys.exit(1)
+
+    img_path = sys.argv[1]
+    calcola_punteggio_immagine(img_path, mostra_debug=True)
